@@ -20,7 +20,9 @@ const GROUP_PADDING = 24;
 export function layoutDiagram(diagram: NormalizedDiagramSpec): LayoutSpec {
   const pattern = diagram.layout.pattern ?? "flow";
   const nodes =
-    diagram.layoutConstraints.length > 0
+    shouldUseGroupedConstraintLayout(diagram)
+      ? groupedColumnsLayout(diagram)
+      : diagram.layoutConstraints.length > 0
       ? constraintAwareLayout(diagram)
       : pattern === "three_column" || pattern === "stage" || pattern === "encoder_decoder"
       ? groupedColumnsLayout(diagram)
@@ -47,6 +49,18 @@ export function layoutDiagram(diagram: NormalizedDiagramSpec): LayoutSpec {
     edges,
     groups
   };
+}
+
+function shouldUseGroupedConstraintLayout(diagram: NormalizedDiagramSpec): boolean {
+  if (diagram.groups.length < 2) return false;
+  const groupedNodeIds = new Set(diagram.groups.flatMap((group) => group.nodeIds));
+  const groupedRatio = groupedNodeIds.size / Math.max(diagram.nodes.length, 1);
+  const hasColumnSignal = diagram.layoutConstraints.some(
+    (constraint) =>
+      constraint.type === "same_column" ||
+      (constraint.type === "inside" && groupedNodeIds.has(constraint.subject))
+  );
+  return groupedRatio >= 0.6 && hasColumnSignal;
 }
 
 function constraintAwareLayout(diagram: NormalizedDiagramSpec): LayoutNode[] {

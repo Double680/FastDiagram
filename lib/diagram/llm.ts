@@ -117,10 +117,7 @@ export async function createLlmDiagramPlan(
     if (!validated.success) {
       return {
         ok: false,
-        reason: `LLM JSON validation failed: ${validated.error.issues
-          .slice(0, 3)
-          .map((issue) => issue.message)
-          .join("; ")}`
+        reason: `LLM JSON validation failed: ${formatValidationIssues(validated.error.issues)}`
       };
     }
 
@@ -285,6 +282,7 @@ export function buildPlannerSystemPrompt(): string {
     "layoutConstraints 中 main_flow、same_row、same_column 必须使用 nodes 字段，不要使用 modules。",
     "layoutConstraints 中 left_of、right_of、above、below 必须使用 subject 和 object 字段，不要使用 source 和 target 表示节点。",
     "layoutConstraints 中 inside 必须使用 subject 和 container 字段；如果多个节点在同一容器内，输出多个 inside 约束。",
+    "如果要表达输入层、方法层、输出层三列，请用 groups + 多个 inside 约束，不要把 group id 放进 left_of/right_of。",
     "所有 layoutConstraints 的 source 字段只能是 user_explicit 或 model_inferred，用来表示来源，不要填节点 id。",
     "connection.style 只能是 solid 或 dashed；不要使用 lineStyle 字段。",
     "group 必须使用 title 字段，不要使用 label 字段。",
@@ -338,6 +336,15 @@ function parseJsonObject(content: string): unknown {
     }
     throw new Error("LLM response is not valid JSON");
   }
+}
+
+function formatValidationIssues(
+  issues: Array<{ path: Array<string | number>; message: string }>
+): string {
+  return issues
+    .slice(0, 6)
+    .map((issue) => `${issue.path.length ? issue.path.join(".") : "(root)"}: ${issue.message}`)
+    .join("; ");
 }
 
 function coercePlannerJson(value: unknown, policy: PlanningPolicy): unknown {
@@ -394,50 +401,73 @@ function coerceLayoutConstraint(value: unknown, defaultSource: PlanSource): unkn
       : defaultSource;
 
   if (type === "main_flow" || type === "same_row" || type === "same_column") {
+    const nodes =
+      value.nodes ??
+      value.modules ??
+      value.nodeIds ??
+      value.items ??
+      value.children ??
+      value.members;
+    if (!Array.isArray(nodes)) return [];
     return [
       {
         ...value,
-        nodes: value.nodes ?? value.modules,
+        nodes,
         source: provenance
       }
     ];
   }
 
   if (type === "left_of" || type === "right_of" || type === "above" || type === "below") {
+    const subject = value.subject ?? value.source ?? value.from;
+    const object = value.object ?? value.target ?? value.to ?? value.reference;
+    if (typeof subject !== "string" || typeof object !== "string") return [];
     return [
       {
         ...value,
-        subject: value.subject ?? value.source ?? value.from,
-        object: value.object ?? value.target ?? value.to,
+        subject,
+        object,
         source: provenance
       }
     ];
   }
 
   if (type === "inside") {
-    const container = value.container ?? value.group ?? value.target;
-    const subjects = Array.isArray(value.modules)
-      ? value.modules
-      : Array.isArray(value.nodes)
-        ? value.nodes
-        : [value.subject ?? value.source].filter(Boolean);
-    return subjects.map((subject) => ({
-      ...value,
-      subject,
-      container,
-      source: provenance
-    }));
+    const container = value.container ?? value.group ?? value.groupId ?? value.parent ?? value.target;
+    const subjects = firstArray(
+      value.modules,
+      value.nodes,
+      value.nodeIds,
+      value.items,
+      value.children,
+      value.members
+    ) ?? [value.subject ?? value.source ?? value.node].filter(Boolean);
+    if (typeof container !== "string" || subjects.length === 0) return [];
+    return subjects
+      .filter((subject): subject is string => typeof subject === "string")
+      .map((subject) => ({
+        ...value,
+        subject,
+        container,
+        source: provenance
+      }));
   }
 
   if (type === "branch") {
-    return [
-      {
+    const from = value.from ?? value.source ?? value.subject;
+    if (typeof from !== "string") return [];
+    const targets =
+      firstArray(value.targets, value.outputs, value.to) ??
+      [value.to ?? value.target ?? value.object].filter(Boolean);
+    return targets
+      .filter((target): target is string => typeof target === "string")
+      .map((to) => ({
         ...value,
-        from: value.from ?? value.source,
-        to: value.to ?? value.target,
+        from,
+        to,
+        through: firstArray(value.through, value.via, value.nodes, value.modules),
         source: provenance
-      }
-    ];
+      }));
   }
 
   return [
@@ -450,6 +480,10 @@ function coerceLayoutConstraint(value: unknown, defaultSource: PlanSource): unkn
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function firstArray(...values: unknown[]): unknown[] | undefined {
+  return values.find((value): value is unknown[] => Array.isArray(value));
 }
 
 function repairPlan(plan: DiagramPlanDraft, context: GenerationContext): DiagramPlan {

@@ -84,6 +84,80 @@ test("layout keeps nodes inside 16:9 canvas", () => {
   }
 });
 
+test("grouped research framework layout avoids overlaps for multi-input multi-output diagrams", () => {
+  const diagram = normalizeDiagramSpec({
+    title: "多模态智能诊断研究框架图",
+    type: "research_framework",
+    nodes: [
+      { id: "clinical", label: "临床表型数据" },
+      { id: "image", label: "医学影像数据" },
+      { id: "omics", label: "组学数据" },
+      { id: "emr", label: "电子病历文本" },
+      { id: "preprocess", label: "数据预处理" },
+      { id: "feature", label: "特征提取" },
+      { id: "fusion", label: "多模态特征融合", shapeKey: "operator.concat" },
+      { id: "knowledge", label: "知识增强模块" },
+      { id: "model", label: "预测模型", shapeKey: "model.block" },
+      { id: "risk", label: "疾病风险评分" },
+      { id: "classification", label: "诊断分类结果" },
+      { id: "report", label: "可解释性报告" }
+    ],
+    edges: [
+      { id: "e1", from: "clinical", to: "preprocess" },
+      { id: "e2", from: "image", to: "preprocess" },
+      { id: "e3", from: "omics", to: "preprocess" },
+      { id: "e4", from: "emr", to: "preprocess" },
+      { id: "e5", from: "preprocess", to: "feature" },
+      { id: "e6", from: "feature", to: "fusion" },
+      { id: "e7", from: "fusion", to: "model" },
+      { id: "e8", from: "model", to: "risk" },
+      { id: "e9", from: "model", to: "classification" },
+      { id: "e10", from: "model", to: "report" }
+    ],
+    groups: [
+      { id: "input_layer", title: "输入层", nodeIds: ["clinical", "image", "omics", "emr"] },
+      {
+        id: "method_layer",
+        title: "方法层",
+        nodeIds: ["preprocess", "feature", "fusion", "knowledge", "model"]
+      },
+      { id: "output_layer", title: "输出层", nodeIds: ["risk", "classification", "report"] }
+    ],
+    layoutConstraints: [
+      { type: "same_column", nodes: ["clinical", "image", "omics", "emr"], source: "user_explicit" },
+      {
+        type: "same_column",
+        nodes: ["preprocess", "feature", "fusion", "knowledge", "model"],
+        source: "user_explicit"
+      },
+      { type: "same_column", nodes: ["risk", "classification", "report"], source: "user_explicit" },
+      { type: "inside", subject: "clinical", container: "input_layer", source: "user_explicit" }
+    ]
+  });
+  const layout = layoutDiagram(diagram);
+
+  assert.deepEqual(overlappingNodePairs(layout.nodes), []);
+});
+
+function overlappingNodePairs(nodes: Array<{ id: string; x: number; y: number; width: number; height: number }>) {
+  const pairs: string[][] = [];
+  for (let leftIndex = 0; leftIndex < nodes.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < nodes.length; rightIndex += 1) {
+      const a = nodes[leftIndex];
+      const b = nodes[rightIndex];
+      if (
+        a.x < b.x + b.width &&
+        a.x + a.width > b.x &&
+        a.y < b.y + b.height &&
+        a.y + a.height > b.y
+      ) {
+        pairs.push([a.id, b.id]);
+      }
+    }
+  }
+  return pairs;
+}
+
 test("svg renderer emits editable preview primitives", () => {
   const diagram = normalizeDiagramSpec({
     title: "简单流程",
@@ -242,11 +316,12 @@ test("llm planner uses BASE_URL and API_KEY with chat completions format", async
                 layoutConstraints: [
                   {
                     type: "main_flow",
-                    nodes: ["input", "add", "output"],
+                    modules: ["input", "add", "output"],
                     direction: "left_to_right",
                     source: "model_inferred"
                   }
-                ]
+                ],
+                layoutNotes: "使用主流程从左到右布局"
               })
             }
           }
