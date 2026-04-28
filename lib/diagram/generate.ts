@@ -1,5 +1,7 @@
 import type {
   DiagramEdge,
+  DiagramLayoutConstraint,
+  DiagramLayoutConstraintDraft,
   DiagramNode,
   DiagramPlan,
   DiagramPlanConnection,
@@ -13,15 +15,34 @@ import type {
   PlanSource
 } from "./types.ts";
 import { layoutDiagram } from "./layout.ts";
-import { createLlmDiagramPlan } from "./llm.ts";
+import { createLlmDiagramPlan, getLlmStatus } from "./llm.ts";
 import { normalizeDiagramSpec, sanitizeId } from "./normalize.ts";
 import { renderSvg } from "./render-svg.ts";
 
 export async function generateDiagram(input: GenerateInput): Promise<GenerateOutput> {
   const prompt = input.prompt.trim();
   const context = createGenerationContext(prompt, input.diagramType);
+  const llmStatus = getLlmStatus();
   const llmResult = await createLlmDiagramPlan(context);
-  const plan = selectPlan(context, llmResult.ok ? llmResult.plan : null);
+  let planner: GenerateOutput["planner"];
+  let plan: DiagramPlan;
+
+  if (llmResult.ok) {
+    planner = {
+      source: "llm",
+      model: llmResult.model
+    };
+    plan = selectLlmPlan(llmResult.plan);
+  } else {
+    if (llmStatus.configured) {
+      throw new Error(`LLM planner failed: ${llmResult.reason}`);
+    }
+    planner = {
+      source: "rule_based",
+      fallbackReason: llmResult.reason
+    };
+    plan = createRuleBasedPlan(context);
+  }
   const rawSpec = planToDiagramSpec(plan, context);
   const diagram = normalizeDiagramSpec(rawSpec);
   const layout = layoutDiagram(diagram);
@@ -29,6 +50,7 @@ export async function generateDiagram(input: GenerateInput): Promise<GenerateOut
 
   return {
     context,
+    planner,
     plan,
     diagram,
     layout,
@@ -36,16 +58,8 @@ export async function generateDiagram(input: GenerateInput): Promise<GenerateOut
   };
 }
 
-function selectPlan(context: GenerationContext, llmPlan: DiagramPlan | null): DiagramPlan {
-  if (llmPlan && !shouldUseDetailedTransformerTemplate(context.rawPrompt, llmPlan)) {
-    return llmPlan;
-  }
-
-  if (llmPlan && shouldUseDetailedTransformerTemplate(context.rawPrompt, llmPlan)) {
-    return transformerPlan("mixed");
-  }
-
-  return createRuleBasedPlan(context);
+function selectLlmPlan(llmPlan: DiagramPlan): DiagramPlan {
+  return llmPlan;
 }
 
 export function createGenerationContext(
@@ -85,9 +99,10 @@ type PlanConnectionDraft = Omit<DiagramPlanConnection, "source"> & {
   source?: PlanSource;
 };
 
-type PlanDraft = Omit<DiagramPlan, "modules" | "connections"> & {
+type PlanDraft = Omit<DiagramPlan, "modules" | "connections" | "layoutConstraints"> & {
   modules: PlanModuleDraft[];
   connections: PlanConnectionDraft[];
+  layoutConstraints?: DiagramLayoutConstraintDraft[];
 };
 
 function makePlan(plan: PlanDraft, defaultSource: PlanSource): DiagramPlan {
@@ -100,7 +115,11 @@ function makePlan(plan: PlanDraft, defaultSource: PlanSource): DiagramPlan {
     connections: plan.connections.map((connection) => ({
       ...connection,
       source: connection.source ?? defaultSource
-    }))
+    })),
+    layoutConstraints: plan.layoutConstraints?.map((constraint) => ({
+      ...constraint,
+      source: constraint.source ?? defaultSource
+    })) as DiagramLayoutConstraint[] | undefined
   };
 }
 
@@ -152,6 +171,13 @@ function createRuleBasedPlan(context: GenerationContext): DiagramPlan {
             { from: "method", to: "experiment" },
             { from: "experiment", to: "output" }
           ],
+          layoutConstraints: [
+            {
+              type: "main_flow",
+              nodes: ["need", "data", "method", "experiment", "output"],
+              direction: "left_to_right"
+            }
+          ],
           layoutNotes: ["阶段式横向布局"],
           simplificationNotes: ["MVP 规则生成，后续可由 LLM 补全专业模块"]
         },
@@ -181,6 +207,13 @@ function createRuleBasedPlan(context: GenerationContext): DiagramPlan {
             { from: "feature", to: "model" },
             { from: "model", to: "head" },
             { from: "head", to: "output" }
+          ],
+          layoutConstraints: [
+            {
+              type: "main_flow",
+              nodes: ["input", "feature", "model", "head", "output"],
+              direction: "top_to_bottom"
+            }
           ],
           layoutNotes: ["上下分层布局"]
         },
@@ -215,6 +248,16 @@ function createRuleBasedPlan(context: GenerationContext): DiagramPlan {
             { from: "model", to: "result" },
             { from: "result", to: "application" }
           ],
+          layoutConstraints: [
+            {
+              type: "main_flow",
+              nodes: ["object", "analysis", "model", "result", "application"],
+              direction: "left_to_right"
+            },
+            { type: "same_column", nodes: ["object", "data"] },
+            { type: "same_column", nodes: ["analysis", "model"] },
+            { type: "same_column", nodes: ["result", "application"] }
+          ],
           layoutNotes: ["输入-方法-输出三栏布局"]
         },
         "model_inferred"
@@ -224,11 +267,6 @@ function createRuleBasedPlan(context: GenerationContext): DiagramPlan {
 
 function createExplicitPlan(context: GenerationContext): DiagramPlan | null {
   const prompt = context.rawPrompt;
-  const strict = /严格按照|不要增加|不要新增|不需要补充|只按|仅按|完全按照/.test(prompt);
-  if (!strict && /transformer|encoder[-\s]?decoder|编码器|解码器/i.test(prompt)) {
-    return null;
-  }
-
   const sequentialLabels = extractSequentialLabels(prompt);
   const labels = extractExplicitModuleLabels(prompt);
   const branchConnections = extractExplicitBranchConnections(prompt);
@@ -274,11 +312,18 @@ function createExplicitPlan(context: GenerationContext): DiagramPlan | null {
       to: to.id,
       meaning: connection.meaning,
       style: connection.style,
+      role: connection.style === "dashed" ? "reference" : "branch",
       source: "user_explicit"
     });
   }
 
   const connections = dedupeConnections([...relationConnections, ...dashedConnections]);
+  const layoutConstraints = buildExplicitLayoutConstraints(
+    sequentialLabels,
+    moduleByLabel,
+    branchConnections,
+    context
+  );
   const unresolvedQuestions =
     connections.length === 0 && modules.length > 1
       ? ["用户列出了模块，但没有明确模块之间的连接关系。"]
@@ -292,6 +337,7 @@ function createExplicitPlan(context: GenerationContext): DiagramPlan | null {
       mainIdea: "根据用户明确描述整理 Diagram 模块与连接，不额外补充业务模块。",
       modules,
       connections,
+      layoutConstraints,
       layoutNotes: layoutNotesFromContext(context),
       unresolvedQuestions
     },
@@ -371,12 +417,14 @@ function extractExplicitBranchConnections(prompt: string): Array<{
   from: string;
   to: string;
   meaning?: string;
+  placement?: "top" | "bottom" | "left" | "right";
   style?: "solid" | "dashed";
 }> {
   const connections: Array<{
     from: string;
     to: string;
     meaning?: string;
+    placement?: "top" | "bottom" | "left" | "right";
     style?: "solid" | "dashed";
   }> = [];
   const pattern =
@@ -389,10 +437,73 @@ function extractExplicitBranchConnections(prompt: string): Array<{
       from,
       to,
       meaning: match[2] ? "虚线连接" : undefined,
+      placement: inferPlacement(match[0]),
       style: match[2] ? "dashed" : "solid"
     });
   }
   return connections;
+}
+
+function buildExplicitLayoutConstraints(
+  sequentialLabels: string[],
+  moduleByLabel: Map<string, PlanModuleDraft>,
+  branchConnections: Array<{
+    from: string;
+    to: string;
+    placement?: "top" | "bottom" | "left" | "right";
+  }>,
+  context: GenerationContext
+): DiagramLayoutConstraintDraft[] {
+  const constraints: DiagramLayoutConstraintDraft[] = [];
+  const mainFlowNodes = sequentialLabels
+    .map((label) => findModuleByLabel(moduleByLabel, label)?.id)
+    .filter((id): id is string => Boolean(id));
+
+  if (mainFlowNodes.length >= 2) {
+    constraints.push({
+      type: "main_flow",
+      nodes: Array.from(new Set(mainFlowNodes)),
+      direction:
+        context.layoutPreference?.direction === "top_to_bottom"
+          ? "top_to_bottom"
+          : "left_to_right",
+      source: "user_explicit"
+    });
+  }
+
+  for (const connection of branchConnections) {
+    const from = findModuleByLabel(moduleByLabel, connection.from);
+    const to = findModuleByLabel(moduleByLabel, connection.to);
+    if (!from || !to || from.id === to.id) continue;
+
+    constraints.push({
+      type: "branch",
+      from: from.id,
+      to: to.id,
+      placement: connection.placement,
+      source: "user_explicit"
+    });
+
+    if (connection.placement === "left") {
+      constraints.push({ type: "left_of", subject: from.id, object: to.id, source: "user_explicit" });
+    } else if (connection.placement === "right") {
+      constraints.push({ type: "right_of", subject: from.id, object: to.id, source: "user_explicit" });
+    } else if (connection.placement === "top") {
+      constraints.push({ type: "above", subject: from.id, object: to.id, source: "user_explicit" });
+    } else if (connection.placement === "bottom") {
+      constraints.push({ type: "below", subject: from.id, object: to.id, source: "user_explicit" });
+    }
+  }
+
+  return constraints;
+}
+
+function inferPlacement(text: string): "top" | "bottom" | "left" | "right" | undefined {
+  if (/左侧|左边|左方|从左/.test(text)) return "left";
+  if (/右侧|右边|右方|从右/.test(text)) return "right";
+  if (/上方|上侧|上面|从上/.test(text)) return "top";
+  if (/下方|下侧|下面|从下/.test(text)) return "bottom";
+  return undefined;
 }
 
 function findModuleByLabel(
@@ -446,32 +557,6 @@ function layoutNotesFromContext(context: GenerationContext): string[] {
   return notes;
 }
 
-function shouldUseDetailedTransformerTemplate(prompt: string, plan: DiagramPlan): boolean {
-  const strict = /严格按照|不要增加|不要新增|不需要补充|只按|仅按|完全按照/.test(prompt);
-  if (strict || !/transformer|encoder[-\s]?decoder|编码器|解码器/i.test(prompt)) {
-    return false;
-  }
-
-  const hasEncoderGroup = plan.groups?.some((group) => /encoder|编码器/i.test(group.title));
-  const hasDecoderGroup = plan.groups?.some((group) => /decoder|解码器/i.test(group.title));
-  const hasResidualAdd = plan.modules.some((module) => module.shapeKey === "operator.add");
-  const hasConcat = plan.modules.some((module) => module.shapeKey === "operator.concat");
-  const hasLayerNorm = plan.modules.some((module) => /layer\s*norm|layernorm|归一化/i.test(module.label));
-  const hasCrossAttention = plan.modules.some((module) =>
-    /cross[-\s]?attention|交叉注意力/i.test(module.label)
-  );
-
-  return (
-    plan.modules.length < 15 ||
-    !hasEncoderGroup ||
-    !hasDecoderGroup ||
-    !hasResidualAdd ||
-    !hasConcat ||
-    !hasLayerNorm ||
-    !hasCrossAttention
-  );
-}
-
 function planToDiagramSpec(plan: DiagramPlan, context: GenerationContext): DiagramSpec {
   const nodes: DiagramNode[] = plan.modules.map((module, index) => ({
     id: module.id,
@@ -488,7 +573,7 @@ function planToDiagramSpec(plan: DiagramPlan, context: GenerationContext): Diagr
     to: connection.to,
     label: connection.meaning,
     style: connection.style ?? "solid",
-    kind: connection.style === "dashed" ? "auxiliary" : "main"
+    kind: connection.role ?? (connection.style === "dashed" ? "auxiliary" : "main")
   }));
 
   return {
@@ -500,11 +585,10 @@ function planToDiagramSpec(plan: DiagramPlan, context: GenerationContext): Diagr
       plan.groups?.map((group) => ({
         id: group.id,
         title: group.title,
-        nodeIds: plan.modules
-          .filter((module) => module.groupId === group.id)
-          .map((module) => module.id),
+        nodeIds: groupNodeIdsFromPlan(plan, group.id),
         kind: context.diagramType === "technical_route" ? "stage" : "container"
       })) ?? [],
+    layoutConstraints: plan.layoutConstraints ?? [],
     layout: context.layoutPreference,
     style: {
       preset: context.stylePreset
@@ -637,7 +721,7 @@ function transformerPlan(intentType: PlanIntentType = "conceptual"): DiagramPlan
         { id: "softmax", label: "Softmax", groupId: "output" },
         { id: "prob", label: "输出概率", groupId: "output" }
       ],
-      connections: [
+          connections: [
         { from: "src_tokens", to: "src_embed" },
         { from: "src_embed", to: "src_pos" },
         { from: "src_pos", to: "enc_self_attn" },
@@ -670,6 +754,31 @@ function transformerPlan(intentType: PlanIntentType = "conceptual"): DiagramPlan
         { from: "dec_norm_3", to: "linear" },
         { from: "linear", to: "softmax" },
         { from: "softmax", to: "prob" }
+      ],
+      layoutConstraints: [
+        {
+          type: "main_flow",
+          nodes: ["src_tokens", "src_embed", "src_pos", "enc_self_attn", "memory"],
+          direction: "top_to_bottom"
+        },
+        {
+          type: "main_flow",
+          nodes: [
+            "tgt_tokens",
+            "tgt_embed",
+            "tgt_pos",
+            "dec_masked_attn",
+            "dec_cross_attn",
+            "dec_ffn",
+            "dec_norm_3",
+            "linear",
+            "softmax",
+            "prob"
+          ],
+          direction: "top_to_bottom"
+        },
+        { type: "left_of", subject: "encoder", object: "decoder" },
+        { type: "branch", from: "memory", to: "dec_cross_attn", placement: "left" }
       ],
       layoutNotes: ["Source Input、Encoder、Decoder、Output 四栏分组，Encoder/Decoder 内部自上而下展开"],
       assumptions: [
@@ -751,13 +860,26 @@ function inferDiagramType(prompt: string): DiagramType {
   if (/技术路线|路线图|阶段|任务[一二三四五六七八九十]/.test(prompt)) {
     return "technical_route";
   }
-  if (/模型|架构|网络|transformer|encoder|decoder|算法/i.test(prompt)) {
-    return "model_architecture";
-  }
   if (/研究框架|框架图|项目申请|研究内容|总体框架/.test(prompt)) {
     return "research_framework";
   }
+  if (/模型|架构|网络|transformer|encoder|decoder|算法/i.test(prompt)) {
+    return "model_architecture";
+  }
   return "general";
+}
+
+function groupNodeIdsFromPlan(plan: DiagramPlan, groupId: string): string[] {
+  const fromModuleGroup = plan.modules
+    .filter((module) => module.groupId === groupId)
+    .map((module) => module.id);
+  const fromInsideConstraints = (plan.layoutConstraints ?? [])
+    .filter(
+      (constraint): constraint is Extract<DiagramLayoutConstraint, { type: "inside" }> =>
+        constraint.type === "inside" && constraint.container === groupId
+    )
+    .map((constraint) => constraint.subject);
+  return Array.from(new Set([...fromModuleGroup, ...fromInsideConstraints]));
 }
 
 function inferModelPattern(prompt: string) {

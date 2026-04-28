@@ -1,6 +1,7 @@
 import type {
   DiagramEdge,
   DiagramGroup,
+  DiagramLayoutConstraint,
   DiagramNode,
   DiagramSpec,
   DiagramType,
@@ -17,6 +18,12 @@ export function normalizeDiagramSpec(spec: DiagramSpec): NormalizedDiagramSpec {
   const nodeIds = new Set(nodes.map((node) => node.id));
   const edges = normalizeEdges(spec.edges ?? [], nodeIds);
   const groups = normalizeGroups(spec.groups ?? [], nodes);
+  const groupIds = new Set(groups.map((group) => group.id));
+  const layoutConstraints = normalizeLayoutConstraints(
+    spec.layoutConstraints ?? [],
+    nodeIds,
+    groupIds
+  );
 
   return {
     title: spec.title?.trim() || defaultTitle(type),
@@ -24,6 +31,7 @@ export function normalizeDiagramSpec(spec: DiagramSpec): NormalizedDiagramSpec {
     nodes,
     edges,
     groups,
+    layoutConstraints,
     layout: {
       direction: spec.layout?.direction ?? defaultDirection(type),
       pattern: spec.layout?.pattern ?? defaultPattern(type)
@@ -67,6 +75,82 @@ function normalizeNodes(nodes: DiagramNode[], limit: number): DiagramNode[] {
   }
 
   return normalized;
+}
+
+function normalizeLayoutConstraints(
+  constraints: DiagramLayoutConstraint[],
+  nodeIds: Set<string>,
+  groupIds: Set<string>
+): DiagramLayoutConstraint[] {
+  const normalized: DiagramLayoutConstraint[] = [];
+
+  for (const constraint of constraints) {
+    switch (constraint.type) {
+      case "main_flow": {
+        const nodes = dedupeIds(constraint.nodes.filter((id) => nodeIds.has(id)));
+        if (nodes.length >= 2) {
+          normalized.push({
+            ...constraint,
+            nodes,
+            source: constraint.source ?? "model_inferred"
+          });
+        }
+        break;
+      }
+      case "same_row":
+      case "same_column": {
+        const nodes = dedupeIds(constraint.nodes.filter((id) => nodeIds.has(id)));
+        if (nodes.length >= 2) {
+          normalized.push({
+            ...constraint,
+            nodes,
+            source: constraint.source ?? "model_inferred"
+          });
+        }
+        break;
+      }
+      case "left_of":
+      case "right_of":
+      case "above":
+      case "below":
+        if (nodeIds.has(constraint.subject) && nodeIds.has(constraint.object)) {
+          normalized.push({
+            ...constraint,
+            source: constraint.source ?? "model_inferred"
+          });
+        }
+        break;
+      case "inside":
+        if (nodeIds.has(constraint.subject) && groupIds.has(constraint.container)) {
+          normalized.push({
+            ...constraint,
+            source: constraint.source ?? "model_inferred"
+          });
+        }
+        break;
+      case "branch": {
+        const through = constraint.through?.filter((id) => nodeIds.has(id));
+        if (
+          nodeIds.has(constraint.from) &&
+          nodeIds.has(constraint.to) &&
+          constraint.from !== constraint.to
+        ) {
+          normalized.push({
+            ...constraint,
+            through,
+            source: constraint.source ?? "model_inferred"
+          });
+        }
+        break;
+      }
+    }
+  }
+
+  return normalized;
+}
+
+function dedupeIds(ids: string[]): string[] {
+  return Array.from(new Set(ids));
 }
 
 function inferNodeKind(node: DiagramNode): DiagramNode["kind"] {

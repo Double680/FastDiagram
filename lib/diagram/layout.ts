@@ -20,7 +20,9 @@ const GROUP_PADDING = 24;
 export function layoutDiagram(diagram: NormalizedDiagramSpec): LayoutSpec {
   const pattern = diagram.layout.pattern ?? "flow";
   const nodes =
-    pattern === "three_column" || pattern === "stage" || pattern === "encoder_decoder"
+    diagram.layoutConstraints.length > 0
+      ? constraintAwareLayout(diagram)
+      : pattern === "three_column" || pattern === "stage" || pattern === "encoder_decoder"
       ? groupedColumnsLayout(diagram)
       : diagram.layout.direction === "top_to_bottom"
         ? verticalFlowLayout(diagram)
@@ -44,6 +46,196 @@ export function layoutDiagram(diagram: NormalizedDiagramSpec): LayoutSpec {
     nodes,
     edges,
     groups
+  };
+}
+
+function constraintAwareLayout(diagram: NormalizedDiagramSpec): LayoutNode[] {
+  const mainFlow = diagram.layoutConstraints.find((constraint) => constraint.type === "main_flow");
+  if (!mainFlow) return horizontalFlowLayout(diagram);
+
+  const nodeById = new Map(diagram.nodes.map((node) => [node.id, node]));
+  const mainNodes = mainFlow.nodes
+    .map((id) => nodeById.get(id))
+    .filter((node): node is NormalizedDiagramSpec["nodes"][number] => Boolean(node));
+  if (mainNodes.length < 2) return horizontalFlowLayout(diagram);
+
+  const direction =
+    mainFlow.direction ??
+    (diagram.layout.direction === "top_to_bottom" ? "top_to_bottom" : "left_to_right");
+  const positioned =
+    direction === "top_to_bottom" || direction === "bottom_to_top"
+      ? constrainedVerticalMainFlow(mainNodes, direction)
+      : constrainedHorizontalMainFlow(mainNodes, direction);
+
+  const placed = new Map(positioned.map((node) => [node.id, node]));
+  const remaining = diagram.nodes.filter((node) => !placed.has(node.id));
+
+  for (const node of remaining) {
+    const relative = findRelativeConstraint(diagram, node.id, placed);
+    const size = nodeSize(node, 190);
+    const layoutNode = relative
+      ? placeRelativeNode(size, relative.anchor, relative.placement)
+      : placeLooseNode(size, placed.size);
+    placed.set(node.id, {
+      id: node.id,
+      ...layoutNode
+    });
+  }
+
+  return diagram.nodes
+    .map((node) => placed.get(node.id))
+    .filter((node): node is LayoutNode => Boolean(node));
+}
+
+function constrainedHorizontalMainFlow(
+  nodes: NormalizedDiagramSpec["nodes"],
+  direction: "left_to_right" | "right_to_left"
+): LayoutNode[] {
+  const ordered = direction === "right_to_left" ? [...nodes].reverse() : nodes;
+  const sizes = ordered.map((node) => nodeSize(node, ordered.length > 6 ? 150 : 190));
+  const usableWidth = CANVAS_WIDTH - MARGIN_X * 2;
+  const totalNodeWidth = sizes.reduce((sum, size) => sum + size.width, 0);
+  const gap = ordered.length <= 1 ? 0 : Math.max(36, (usableWidth - totalNodeWidth) / (ordered.length - 1));
+  const totalWidth = totalNodeWidth + gap * Math.max(0, ordered.length - 1);
+  const centerY = MARGIN_TOP + (CANVAS_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM) / 2;
+  let x = MARGIN_X + Math.max(0, (usableWidth - totalWidth) / 2);
+
+  const laidOut = ordered.map((node, index) => {
+    const size = sizes[index];
+    const layoutNode = {
+      id: node.id,
+      x,
+      y: centerY - size.height / 2,
+      width: size.width,
+      height: size.height
+    };
+    x += size.width + gap;
+    return layoutNode;
+  });
+
+  return direction === "right_to_left" ? laidOut.reverse() : laidOut;
+}
+
+function constrainedVerticalMainFlow(
+  nodes: NormalizedDiagramSpec["nodes"],
+  direction: "top_to_bottom" | "bottom_to_top"
+): LayoutNode[] {
+  const ordered = direction === "bottom_to_top" ? [...nodes].reverse() : nodes;
+  const sizes = ordered.map((node) => nodeSize(node, 230, ordered.length >= 8));
+  const usableHeight = CANVAS_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM;
+  const totalNodeHeight = sizes.reduce((sum, size) => sum + size.height, 0);
+  const gap = ordered.length <= 1 ? 0 : Math.max(14, (usableHeight - totalNodeHeight) / (ordered.length - 1));
+  const totalHeight = totalNodeHeight + gap * Math.max(0, ordered.length - 1);
+  let y = MARGIN_TOP + Math.max(0, (usableHeight - totalHeight) / 2);
+
+  const laidOut = ordered.map((node, index) => {
+    const size = sizes[index];
+    const layoutNode = {
+      id: node.id,
+      x: (CANVAS_WIDTH - size.width) / 2,
+      y,
+      width: size.width,
+      height: size.height
+    };
+    y += size.height + gap;
+    return layoutNode;
+  });
+
+  return direction === "bottom_to_top" ? laidOut.reverse() : laidOut;
+}
+
+function findRelativeConstraint(
+  diagram: NormalizedDiagramSpec,
+  nodeId: string,
+  placed: Map<string, LayoutNode>
+): { anchor: LayoutNode; placement: "top" | "bottom" | "left" | "right" } | null {
+  for (const constraint of diagram.layoutConstraints) {
+    if (
+      (constraint.type === "left_of" ||
+        constraint.type === "right_of" ||
+        constraint.type === "above" ||
+        constraint.type === "below") &&
+      constraint.subject === nodeId
+    ) {
+      const anchor = placed.get(constraint.object);
+      if (!anchor) continue;
+      return {
+        anchor,
+        placement:
+          constraint.type === "left_of"
+            ? "left"
+            : constraint.type === "right_of"
+              ? "right"
+              : constraint.type === "above"
+                ? "top"
+                : "bottom"
+      };
+    }
+
+    if (constraint.type === "branch" && constraint.from === nodeId) {
+      const anchor = placed.get(constraint.to);
+      if (!anchor) continue;
+      return {
+        anchor,
+        placement: constraint.placement ?? "bottom"
+      };
+    }
+  }
+
+  return null;
+}
+
+function placeRelativeNode(
+  size: { width: number; height: number },
+  anchor: LayoutNode,
+  placement: "top" | "bottom" | "left" | "right"
+) {
+  const gap = 70;
+  const anchorCenter = center(anchor);
+  if (placement === "left") {
+    return clampNodeBox({
+      x: anchor.x - size.width - gap,
+      y: anchorCenter.y - size.height / 2,
+      width: size.width,
+      height: size.height
+    });
+  }
+  if (placement === "right") {
+    return clampNodeBox({
+      x: anchor.x + anchor.width + gap,
+      y: anchorCenter.y - size.height / 2,
+      width: size.width,
+      height: size.height
+    });
+  }
+  if (placement === "top") {
+    return clampNodeBox({
+      x: anchorCenter.x - size.width / 2,
+      y: anchor.y - size.height - gap,
+      width: size.width,
+      height: size.height
+    });
+  }
+  return clampNodeBox({
+    x: anchorCenter.x - size.width / 2,
+    y: anchor.y + anchor.height + gap,
+    width: size.width,
+    height: size.height
+  });
+}
+
+function placeLooseNode(size: { width: number; height: number }, index: number) {
+  const x = MARGIN_X + (index % 4) * 230;
+  const y = CANVAS_HEIGHT - MARGIN_BOTTOM - size.height - Math.floor(index / 4) * 86;
+  return clampNodeBox({ x, y, width: size.width, height: size.height });
+}
+
+function clampNodeBox(rect: { x: number; y: number; width: number; height: number }) {
+  return {
+    x: clamp(rect.x, MARGIN_X / 2, CANVAS_WIDTH - MARGIN_X / 2 - rect.width),
+    y: clamp(rect.y, MARGIN_TOP, CANVAS_HEIGHT - MARGIN_BOTTOM - rect.height),
+    width: rect.width,
+    height: rect.height
   };
 }
 

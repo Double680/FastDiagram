@@ -15,12 +15,22 @@ export async function POST(request: Request) {
     );
   }
 
-  const output = await generateDiagram(parsed.data);
-  return NextResponse.json({
-    diagram: output.diagram,
-    layout: output.layout,
-    svg: output.svg,
-    plan: output.plan,
-    context: output.context
-  });
+  try {
+    const output = await generateDiagram(parsed.data);
+    return NextResponse.json({
+      diagram: output.diagram,
+      layout: output.layout,
+      svg: output.svg,
+      plan: output.plan,
+      context: output.context,
+      planner: output.planner
+    });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error: error instanceof Error ? error.message : "生成失败"
+      },
+      { status: 502 }
+    );
+  }
 }

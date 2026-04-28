@@ -13,6 +13,20 @@ export type LayoutPattern =
   | "stage";
 export type PlanIntentType = "explicit" | "conceptual" | "mixed";
 export type PlanSource = "user_explicit" | "model_inferred";
+export type ConstraintDirection =
+  | "left_to_right"
+  | "right_to_left"
+  | "top_to_bottom"
+  | "bottom_to_top";
+export type RelativePlacement = "top" | "bottom" | "left" | "right";
+export type ConnectionRole =
+  | "main"
+  | "auxiliary"
+  | "branch"
+  | "feedback"
+  | "residual"
+  | "merge"
+  | "reference";
 
 export type GenerationContext = {
   rawPrompt: string;
@@ -38,6 +52,7 @@ export type DiagramPlan = {
   groups?: DiagramPlanGroup[];
   modules: DiagramPlanModule[];
   connections: DiagramPlanConnection[];
+  layoutConstraints?: DiagramLayoutConstraint[];
   layoutNotes?: string[];
   simplificationNotes?: string[];
   assumptions?: string[];
@@ -64,8 +79,59 @@ export type DiagramPlanConnection = {
   to: string;
   meaning?: string;
   style?: "solid" | "dashed";
+  role?: ConnectionRole;
   source: PlanSource;
 };
+
+export type DiagramLayoutConstraint =
+  | {
+      type: "main_flow";
+      nodes: string[];
+      direction?: ConstraintDirection;
+      source: PlanSource;
+    }
+  | {
+      type: "left_of" | "right_of" | "above" | "below";
+      subject: string;
+      object: string;
+      source: PlanSource;
+    }
+  | {
+      type: "same_row" | "same_column";
+      nodes: string[];
+      source: PlanSource;
+    }
+  | {
+      type: "inside";
+      subject: string;
+      container: string;
+      source: PlanSource;
+    }
+  | {
+      type: "branch";
+      from: string;
+      through?: string[];
+      to: string;
+      placement?: RelativePlacement;
+      source: PlanSource;
+    };
+
+export type DiagramLayoutConstraintDraft =
+  | (Omit<Extract<DiagramLayoutConstraint, { type: "main_flow" }>, "source"> & {
+      source?: PlanSource;
+    })
+  | (Omit<Extract<DiagramLayoutConstraint, { type: "left_of" | "right_of" | "above" | "below" }>, "source"> & {
+      source?: PlanSource;
+    })
+  | (Omit<Extract<DiagramLayoutConstraint, { type: "same_row" | "same_column" }>, "source"> & {
+      source?: PlanSource;
+    })
+  | (Omit<Extract<DiagramLayoutConstraint, { type: "inside" }>, "source"> & {
+      source?: PlanSource;
+    })
+  | (Omit<Extract<DiagramLayoutConstraint, { type: "branch" }>, "source"> & {
+      source?: PlanSource;
+    });
 
 export type DiagramNode = {
   id: string;
@@ -90,7 +156,7 @@ export type DiagramEdge = {
   from: string;
   to: string;
   label?: string;
-  kind?: "main" | "branch" | "feedback" | "auxiliary";
+  kind?: ConnectionRole;
   style?: "solid" | "dashed";
 };
 
@@ -116,12 +182,16 @@ export type DiagramSpec = {
   nodes: DiagramNode[];
   edges: DiagramEdge[];
   groups?: DiagramGroup[];
+  layoutConstraints?: DiagramLayoutConstraint[];
   layout?: LayoutIntent;
   style?: StyleIntent;
 };
 
 export type NormalizedDiagramSpec = Required<
-  Pick<DiagramSpec, "type" | "nodes" | "edges" | "groups" | "layout" | "style">
+  Pick<
+    DiagramSpec,
+    "type" | "nodes" | "edges" | "groups" | "layoutConstraints" | "layout" | "style"
+  >
 > & {
   title: string;
 };
@@ -181,6 +251,11 @@ export type GenerateInput = {
 
 export type GenerateOutput = {
   context: GenerationContext;
+  planner: {
+    source: "llm" | "rule_based";
+    model?: string;
+    fallbackReason?: string;
+  };
   plan: DiagramPlan;
   diagram: NormalizedDiagramSpec;
   layout: LayoutSpec;

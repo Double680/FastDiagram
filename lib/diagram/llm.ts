@@ -1,4 +1,6 @@
 import type {
+  DiagramLayoutConstraint,
+  DiagramLayoutConstraintDraft,
   DiagramPlan,
   DiagramPlanConnection,
   DiagramPlanGroup,
@@ -35,6 +37,7 @@ type DiagramPlanDraft = {
   groups?: DiagramPlanGroup[];
   modules: Array<Omit<DiagramPlanModule, "source"> & { source?: PlanSource }>;
   connections: Array<Omit<DiagramPlanConnection, "source"> & { source?: PlanSource }>;
+  layoutConstraints?: DiagramLayoutConstraintDraft[];
   layoutNotes?: string[];
   simplificationNotes?: string[];
   assumptions?: string[];
@@ -109,7 +112,7 @@ export async function createLlmDiagramPlan(
       };
     }
 
-    const parsedJson = parseJsonObject(content);
+    const parsedJson = coercePlannerJson(parseJsonObject(content), createPlanningPolicy(context.rawPrompt));
     const validated = diagramPlanSchema.safeParse(parsedJson);
     if (!validated.success) {
       return {
@@ -140,6 +143,24 @@ export async function createLlmDiagramPlan(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+export function getLlmStatus():
+  | {
+      configured: true;
+      model: string;
+      endpoint: string;
+    }
+  | {
+      configured: false;
+    } {
+  const config = getLlmConfig();
+  if (!config) return { configured: false };
+  return {
+    configured: true,
+    model: config.model,
+    endpoint: config.endpoint
+  };
 }
 
 function getLlmConfig() {
@@ -185,13 +206,13 @@ export function createPlanningPolicy(prompt: string): PlanningPolicy {
     hasModuleList ? "has_module_list" : ""
   ].filter(Boolean);
 
-  if (!strict && isKnownArchitecture) {
+  if (!strict && isKnownArchitecture && !hasConcreteRelation && !hasModuleList) {
     return {
-      intentType: hasConcreteRelation || hasModuleList ? "mixed" : "conceptual",
+      intentType: "conceptual",
       allowInference: true,
-      defaultSource: hasConcreteRelation || hasModuleList ? "user_explicit" : "model_inferred",
+      defaultSource: "model_inferred",
       instruction:
-        "用户在描述经典模型架构。保留用户明确列出的模块，同时允许补全该架构的典型内部模块、残差/归一化/注意力/拼接等结构；补全内容必须标记为 model_inferred，并在 assumptions 中说明。",
+        "用户只给出经典架构主题。可以补全一个合理初稿，但补全内容必须标记为 model_inferred，并在 assumptions 中说明。",
       evidence
     };
   }
@@ -241,25 +262,37 @@ export function createPlanningPolicy(prompt: string): PlanningPolicy {
 
 export function buildPlannerSystemPrompt(): string {
   return [
-    "你是一个学术 Diagram 结构规划器。",
-    "你的任务是把中文自然语言绘图需求转换为严格 JSON 的 DiagramPlan。",
+    "你是一个通用 Diagram 结构解析器。",
+    "你的任务不是设计最终视觉效果，而是把中文绘图描述解析为严格 JSON 的 DiagramPlan。",
     "不要输出 Markdown，不要输出解释，只输出一个 JSON object。",
     "JSON 必须符合：",
-    "{ subject, diagramType, intentType, mainIdea, groups?, modules, connections, layoutNotes?, simplificationNotes?, assumptions?, unresolvedQuestions? }。",
+    "{ subject, diagramType, intentType, mainIdea, groups?, modules, connections, layoutConstraints?, layoutNotes?, simplificationNotes?, assumptions?, unresolvedQuestions? }。",
     "diagramType 只能是 technical_route、research_framework、model_architecture、general。",
+    "diagramType 必须等于用户消息中的 context.diagramType。",
     "intentType 只能是 explicit、conceptual、mixed，并应等于用户消息中的 planningPolicy.intentType。",
     "module.id、group.id 必须使用简短稳定的 snake_case ASCII 标识。",
     "module.label 使用用户语言，优先中文；必要时保留通用英文术语。",
     "每个 module 必须包含 source，取值只能是 user_explicit 或 model_inferred。",
     "每个 connection 必须包含 source，取值只能是 user_explicit 或 model_inferred。",
     "connection.from 和 connection.to 必须引用 modules 中存在的 id。",
+    "connection.role 可使用 main、auxiliary、branch、feedback、residual、merge、reference。",
     "shapeKey 只能从 availableShapeKeys 中选择；不确定时使用 basic.round_rect。",
-    "残差连接、Add、相加节点使用 operator.add，且应作为真实 module。",
-    "拼接、Concatenate、Concat、特征融合节点使用 operator.concat，且应作为真实 module。",
-    "注意力、Encoder、Decoder、模型块优先使用 model.attention 或 model.block。",
+    "如果用户提到 Add、相加、残差汇合，可使用 operator.add 作为真实 module；如果用户提到 Concat、Concatenate、拼接、融合，可使用 operator.concat 作为真实 module。",
+    "如果用户提到包含、放在、框起来、属于、整体包在，应生成 groups 或 inside 布局约束。",
+    "如果用户提到左边、右边、上方、下方、并列、同一行、同一列、上下三层、左右结构，应生成 layoutConstraints。",
+    "如果用户提到 A 指向 B、A 连接 B、A 后面接 B，应生成 connections；主流程还应生成 main_flow 布局约束。",
+    "layoutConstraints 支持 main_flow、left_of、right_of、above、below、same_row、same_column、inside、branch。",
+    "layoutConstraints 中 main_flow、same_row、same_column 必须使用 nodes 字段，不要使用 modules。",
+    "layoutConstraints 中 left_of、right_of、above、below 必须使用 subject 和 object 字段，不要使用 source 和 target 表示节点。",
+    "layoutConstraints 中 inside 必须使用 subject 和 container 字段；如果多个节点在同一容器内，输出多个 inside 约束。",
+    "所有 layoutConstraints 的 source 字段只能是 user_explicit 或 model_inferred，用来表示来源，不要填节点 id。",
+    "connection.style 只能是 solid 或 dashed；不要使用 lineStyle 字段。",
+    "group 必须使用 title 字段，不要使用 label 字段。",
+    "layoutConstraints 只表达相对位置和逻辑，不要输出具体坐标。",
     "当 planningPolicy.allowInference 为 false 时，不得新增用户没有明确提到的业务模块，不得补全常识模块。",
     "当 planningPolicy.allowInference 为 false 且连接关系不明确时，把问题写入 unresolvedQuestions，不要臆造连接。",
     "当 planningPolicy.allowInference 为 true 时，允许合理补全，但必须把补全内容标记为 model_inferred，并在 assumptions 中说明。",
+    "layoutNotes、simplificationNotes、assumptions、unresolvedQuestions 必须是字符串数组；没有内容时输出空数组或省略。",
     "节点数量不要超过 context.nodeLimit。",
     "不要生成坐标、尺寸、颜色、SVG 或 PPTX 字段。"
   ].join("\n");
@@ -278,7 +311,18 @@ export function buildPlannerUserPayload(
       category: shape.category,
       defaultLabel: shape.defaultLabel,
       preferredFlow: shape.connectionPolicy.preferredFlow
-    }))
+    })),
+    availableLayoutConstraintTypes: [
+      "main_flow",
+      "left_of",
+      "right_of",
+      "above",
+      "below",
+      "same_row",
+      "same_column",
+      "inside",
+      "branch"
+    ]
   };
 }
 
@@ -294,6 +338,118 @@ function parseJsonObject(content: string): unknown {
     }
     throw new Error("LLM response is not valid JSON");
   }
+}
+
+function coercePlannerJson(value: unknown, policy: PlanningPolicy): unknown {
+  if (!isRecord(value)) return value;
+  const plan = { ...value };
+
+  if (Array.isArray(plan.groups)) {
+    plan.groups = plan.groups.map((group) => {
+      if (!isRecord(group)) return group;
+      return {
+        ...group,
+        title: group.title ?? group.label ?? group.name
+      };
+    });
+  }
+
+  if (Array.isArray(plan.connections)) {
+    plan.connections = plan.connections.map((connection) => {
+      if (!isRecord(connection)) return connection;
+      return {
+        ...connection,
+        style: connection.style ?? connection.lineStyle
+      };
+    });
+  }
+
+  if (Array.isArray(plan.layoutConstraints)) {
+    plan.layoutConstraints = plan.layoutConstraints.flatMap((constraint) =>
+      coerceLayoutConstraint(constraint, policy.defaultSource)
+    );
+  }
+
+  for (const key of [
+    "layoutNotes",
+    "simplificationNotes",
+    "assumptions",
+    "unresolvedQuestions"
+  ]) {
+    const noteValue = plan[key];
+    if (typeof noteValue === "string") {
+      plan[key] = [noteValue];
+    }
+  }
+
+  return plan;
+}
+
+function coerceLayoutConstraint(value: unknown, defaultSource: PlanSource): unknown[] {
+  if (!isRecord(value)) return [value];
+  const type = value.type;
+  const provenance =
+    value.source === "user_explicit" || value.source === "model_inferred"
+      ? value.source
+      : defaultSource;
+
+  if (type === "main_flow" || type === "same_row" || type === "same_column") {
+    return [
+      {
+        ...value,
+        nodes: value.nodes ?? value.modules,
+        source: provenance
+      }
+    ];
+  }
+
+  if (type === "left_of" || type === "right_of" || type === "above" || type === "below") {
+    return [
+      {
+        ...value,
+        subject: value.subject ?? value.source ?? value.from,
+        object: value.object ?? value.target ?? value.to,
+        source: provenance
+      }
+    ];
+  }
+
+  if (type === "inside") {
+    const container = value.container ?? value.group ?? value.target;
+    const subjects = Array.isArray(value.modules)
+      ? value.modules
+      : Array.isArray(value.nodes)
+        ? value.nodes
+        : [value.subject ?? value.source].filter(Boolean);
+    return subjects.map((subject) => ({
+      ...value,
+      subject,
+      container,
+      source: provenance
+    }));
+  }
+
+  if (type === "branch") {
+    return [
+      {
+        ...value,
+        from: value.from ?? value.source,
+        to: value.to ?? value.target,
+        source: provenance
+      }
+    ];
+  }
+
+  return [
+    {
+      ...value,
+      source: provenance
+    }
+  ];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function repairPlan(plan: DiagramPlanDraft, context: GenerationContext): DiagramPlan {
@@ -337,7 +493,7 @@ function repairPlan(plan: DiagramPlanDraft, context: GenerationContext): Diagram
   return {
     ...plan,
     subject: plan.subject.trim(),
-    diagramType: plan.diagramType || context.diagramType,
+    diagramType: context.diagramType,
     intentType: plan.intentType ?? policy.intentType,
     groups,
     modules,
@@ -353,8 +509,107 @@ function repairPlan(plan: DiagramPlanDraft, context: GenerationContext): Diagram
           moduleIds.has(connection.from) &&
           moduleIds.has(connection.to) &&
           connection.from !== connection.to
-      )
+      ),
+    layoutConstraints: repairLayoutConstraints(
+      plan.layoutConstraints ?? [],
+      idMap,
+      groupIdMap,
+      moduleIds,
+      groupIds,
+      policy.defaultSource
+    )
   };
+}
+
+function repairLayoutConstraints(
+  constraints: DiagramPlanDraft["layoutConstraints"],
+  idMap: Map<string, string>,
+  groupIdMap: Map<string, string>,
+  moduleIds: Set<string>,
+  groupIds: Set<string>,
+  defaultSource: PlanSource
+): DiagramLayoutConstraint[] {
+  const repaired: DiagramLayoutConstraint[] = [];
+
+  for (const constraint of constraints ?? []) {
+    switch (constraint.type) {
+      case "main_flow": {
+        const nodes = constraint.nodes
+          .map((id) => idMap.get(id) ?? id)
+          .filter((id) => moduleIds.has(id));
+        if (nodes.length >= 2) {
+          repaired.push({
+            ...constraint,
+            nodes: Array.from(new Set(nodes)),
+            source: constraint.source ?? defaultSource
+          });
+        }
+        break;
+      }
+      case "same_row":
+      case "same_column": {
+        const nodes = constraint.nodes
+          .map((id) => idMap.get(id) ?? id)
+          .filter((id) => moduleIds.has(id));
+        if (nodes.length >= 2) {
+          repaired.push({
+            ...constraint,
+            nodes: Array.from(new Set(nodes)),
+            source: constraint.source ?? defaultSource
+          });
+        }
+        break;
+      }
+      case "left_of":
+      case "right_of":
+      case "above":
+      case "below": {
+        const subject = idMap.get(constraint.subject) ?? constraint.subject;
+        const object = idMap.get(constraint.object) ?? constraint.object;
+        if (moduleIds.has(subject) && moduleIds.has(object) && subject !== object) {
+          repaired.push({
+            ...constraint,
+            subject,
+            object,
+            source: constraint.source ?? defaultSource
+          });
+        }
+        break;
+      }
+      case "inside": {
+        const subject = idMap.get(constraint.subject) ?? constraint.subject;
+        const container = groupIdMap.get(constraint.container) ?? constraint.container;
+        if (moduleIds.has(subject) && groupIds.has(container)) {
+          repaired.push({
+            ...constraint,
+            subject,
+            container,
+            source: constraint.source ?? defaultSource
+          });
+        }
+        break;
+      }
+      case "branch": {
+        const from = idMap.get(constraint.from) ?? constraint.from;
+        const to = idMap.get(constraint.to) ?? constraint.to;
+        const through = constraint.through
+          ?.map((id) => idMap.get(id) ?? id)
+          .filter((id) => moduleIds.has(id));
+        if (moduleIds.has(from) && moduleIds.has(to) && from !== to) {
+          repaired.push({
+            ...constraint,
+            from,
+            to,
+            through,
+            source: constraint.source ?? defaultSource
+          });
+        }
+        break;
+      }
+    }
+  }
+
+  return repaired;
 }
 
 function uniqueId(baseId: string, seen: Set<string>): string {

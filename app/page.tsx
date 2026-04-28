@@ -10,10 +10,15 @@ import type {
 } from "@/lib/diagram/types.ts";
 
 const DEFAULT_PROMPT =
-  "绘制一个 Transformer Encoder-Decoder 架构图，包含输入嵌入、位置编码、编码器堆叠、解码器堆叠、Linear、Softmax 和输出概率，编码器输出用虚线连接到解码器。";
+  "绘制一个研究框架图：输入数据在左侧，后面接数据预处理，再接特征提取和预测模型，右侧输出诊断结果；知识图谱模块放在预测模型下方，并用虚线连接到预测模型；数据预处理、特征提取和预测模型都包含在“方法层”外框中。";
 
 type GenerateResponse = {
   context: GenerationContext;
+  planner: {
+    source: "llm" | "rule_based";
+    model?: string;
+    fallbackReason?: string;
+  };
   plan: DiagramPlan;
   diagram: NormalizedDiagramSpec;
   layout: LayoutSpec;
@@ -96,6 +101,7 @@ export default function Page() {
     if (!result) return "";
     return JSON.stringify(
       {
+        planner: result.planner,
         plan: result.plan,
         diagram: result.diagram
       },
@@ -160,7 +166,7 @@ export default function Page() {
           <h2 className="preview-title">{result?.diagram.title ?? "预览"}</h2>
           <span className="hint">
             {result
-              ? `${result.plan.intentType}，${result.diagram.nodes.length} 个模块，${result.diagram.edges.length} 条连接`
+              ? `${result.planner.source === "llm" ? `LLM: ${result.planner.model}` : "规则 fallback"}，${result.plan.intentType}，${result.diagram.nodes.length} 个模块，${result.diagram.edges.length} 条连接`
               : loading
                 ? "正在生成新的 Diagram"
                 : "生成后显示 SVG 预览"}
@@ -179,6 +185,12 @@ export default function Page() {
         {result ? (
           <div className="plan-summary">
             <strong>DiagramPlan</strong>
+            <span>
+              Planner：
+              {result.planner.source === "llm"
+                ? `LLM (${result.planner.model})`
+                : `规则 fallback：${result.planner.fallbackReason ?? "未配置 LLM"}`}
+            </span>
             <span>用户显式模块：{result.plan.modules.filter((item) => item.source === "user_explicit").length}</span>
             <span>模型推断模块：{result.plan.modules.filter((item) => item.source === "model_inferred").length}</span>
             {result.plan.unresolvedQuestions?.length ? (

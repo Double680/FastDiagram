@@ -236,8 +236,16 @@ test("llm planner uses BASE_URL and API_KEY with chat completions format", async
                   }
                 ],
                 connections: [
-                  { from: "input", to: "add", source: "model_inferred" },
-                  { from: "add", to: "output", source: "model_inferred" }
+                  { from: "input", to: "add", role: "main", source: "model_inferred" },
+                  { from: "add", to: "output", role: "main", source: "model_inferred" }
+                ],
+                layoutConstraints: [
+                  {
+                    type: "main_flow",
+                    nodes: ["input", "add", "output"],
+                    direction: "left_to_right",
+                    source: "model_inferred"
+                  }
                 ]
               })
             }
@@ -262,8 +270,41 @@ test("llm planner uses BASE_URL and API_KEY with chat completions format", async
     const body = requestedBodies[0];
     assert.equal(body.response_format.type, "json_object");
     assert.match(body.messages[0]?.content ?? "", /DiagramPlan/);
+    assert.match(body.messages[0]?.content ?? "", /layoutConstraints/);
     assert.match(body.messages[1]?.content ?? "", /planningPolicy/);
     assert.equal(result.ok && result.plan.modules[1].shapeKey, "operator.add");
+    assert.equal(
+      result.ok && result.plan.layoutConstraints?.some((constraint) => constraint.type === "main_flow"),
+      true
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.env.BASE_URL = "";
+    process.env.API_KEY = "";
+    process.env.MODEL = "";
+  }
+});
+
+test("configured llm failure is not silently replaced by rule based generation", async () => {
+  const originalFetch = globalThis.fetch;
+  process.env.BASE_URL = "https://llm.example.test/v1";
+  process.env.API_KEY = "test-key";
+  process.env.MODEL = "test-model";
+
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ error: "bad request" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" }
+    })) as typeof fetch;
+
+  try {
+    await assert.rejects(
+      () =>
+        generateDiagram({
+          prompt: "输入是 A，后面接 B，最后输出 C"
+        }),
+      /LLM planner failed/
+    );
   } finally {
     globalThis.fetch = originalFetch;
     process.env.BASE_URL = "";
@@ -284,12 +325,42 @@ test("planning policy disables inference for concrete instructions", () => {
   assert.equal(payload.planningPolicy.defaultSource, "user_explicit");
 });
 
-test("planning policy treats transformer module lists as mixed architecture requests", () => {
+test("research framework wording takes priority over model keyword", () => {
+  const context = createGenerationContext(
+    "绘制一个研究框架图：输入数据后面接预测模型，右侧输出诊断结果"
+  );
+
+  assert.equal(context.diagramType, "research_framework");
+  assert.equal(context.layoutPreference?.pattern, "three_column");
+});
+
+test("planning policy treats concrete transformer module lists as explicit structure requests", () => {
   const context = createGenerationContext(
     "绘制一个 Transformer Encoder-Decoder 架构图，包含输入嵌入、位置编码、编码器堆叠、解码器堆叠、Linear、Softmax 和输出概率"
   );
   const policy = createPlanningPolicy(context.rawPrompt);
 
-  assert.equal(policy.intentType, "mixed");
-  assert.equal(policy.allowInference, true);
+  assert.equal(policy.intentType, "explicit");
+  assert.equal(policy.allowInference, false);
+});
+
+test("explicit parser records main flow and relative branch layout constraints", async () => {
+  const result = await generateDiagram({
+    prompt:
+      "输入是多模态数据，后面接数据预处理，再接预测模型，知识图谱模块从左侧虚线连接到预测模型，最后输出诊断结果。"
+  });
+  const mainFlow = result.diagram.layoutConstraints.find(
+    (constraint) => constraint.type === "main_flow"
+  );
+  const leftOf = result.diagram.layoutConstraints.find(
+    (constraint) => constraint.type === "left_of"
+  );
+  const kg = result.diagram.nodes.find((node) => node.label === "知识图谱");
+  const model = result.diagram.nodes.find((node) => node.label === "预测模型");
+  const kgLayout = result.layout.nodes.find((node) => node.id === kg?.id);
+  const modelLayout = result.layout.nodes.find((node) => node.id === model?.id);
+
+  assert.equal(mainFlow?.source, "user_explicit");
+  assert.equal(leftOf?.source, "user_explicit");
+  assert.ok(kgLayout && modelLayout && kgLayout.x < modelLayout.x);
 });
