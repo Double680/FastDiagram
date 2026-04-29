@@ -41,12 +41,14 @@ npm install
 BASE_URL=https://api.openai.com/v1
 API_KEY=replace_with_your_api_key
 MODEL=gemini-3-pro-all
+LLM_REQUEST_TIMEOUT_MS=120000
 ```
 
 说明：
 
 - `BASE_URL` 可以是 API 根路径，也可以是完整的 `/chat/completions` 地址
 - `BASE_URL` 或 `API_KEY` 为空时，系统会自动使用本地规则生成器
+- `LLM_REQUEST_TIMEOUT_MS` 为可选项，复杂模型架构图建议使用 `120000` 或更高，最大会限制为 `300000`
 
 启动开发环境：
 
@@ -173,4 +175,3 @@ model.attention
 - 暂不支持基于 `PatchSpec` 的局部修改
 - 复杂大图的自动布局仍有优化空间
 - 自定义形状模板仍未开放上传
-

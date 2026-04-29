@@ -19,7 +19,9 @@ import {
 import { sanitizeId } from "./normalize.ts";
 
 const DEFAULT_MODEL = "gpt-4o-mini";
-const REQUEST_TIMEOUT_MS = 45_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+const MIN_REQUEST_TIMEOUT_MS = 15_000;
+const MAX_REQUEST_TIMEOUT_MS = 300_000;
 
 type ChatCompletionResponse = {
   choices?: Array<{
@@ -67,7 +69,8 @@ export async function createLlmDiagramPlan(
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeoutMs = config.timeoutMs;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const planningPolicy = createPlanningPolicy(context.rawPrompt);
 
   try {
@@ -129,7 +132,7 @@ export async function createLlmDiagramPlan(
   } catch (error) {
     const reason =
       error instanceof Error && error.name === "AbortError"
-        ? "LLM request timed out"
+        ? `LLM request timed out after ${Math.round(timeoutMs / 1000)}s`
         : error instanceof Error
           ? error.message
           : "Unknown LLM request error";
@@ -147,6 +150,7 @@ export function getLlmStatus():
       configured: true;
       model: string;
       endpoint: string;
+      timeoutMs: number;
     }
   | {
       configured: false;
@@ -156,7 +160,8 @@ export function getLlmStatus():
   return {
     configured: true,
     model: config.model,
-    endpoint: config.endpoint
+    endpoint: config.endpoint,
+    timeoutMs: config.timeoutMs
   };
 }
 
@@ -168,8 +173,17 @@ function getLlmConfig() {
   return {
     endpoint: chatCompletionsEndpoint(baseUrl),
     apiKey,
-    model: process.env.MODEL?.trim() || DEFAULT_MODEL
+    model: process.env.MODEL?.trim() || DEFAULT_MODEL,
+    timeoutMs: readRequestTimeoutMs()
   };
+}
+
+function readRequestTimeoutMs(): number {
+  const raw = process.env.LLM_REQUEST_TIMEOUT_MS?.trim();
+  if (!raw) return DEFAULT_REQUEST_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_REQUEST_TIMEOUT_MS;
+  return Math.min(MAX_REQUEST_TIMEOUT_MS, Math.max(MIN_REQUEST_TIMEOUT_MS, parsed));
 }
 
 function chatCompletionsEndpoint(baseUrl: string): string {
@@ -349,26 +363,47 @@ function formatValidationIssues(
 
 function coercePlannerJson(value: unknown, policy: PlanningPolicy): unknown {
   if (!isRecord(value)) return value;
-  const plan = { ...value };
+  const plan: Record<string, unknown> = {
+    ...value,
+    subject: stringValue(value.subject, value.title, value.name) ?? "Diagram 初稿",
+    diagramType: value.diagramType ?? value.type,
+    mainIdea:
+      stringValue(value.mainIdea, value.description, value.summary, value.intent) ?? "解析用户绘图需求"
+  };
 
   if (Array.isArray(plan.groups)) {
     plan.groups = plan.groups.map((group) => {
       if (!isRecord(group)) return group;
       return {
         ...group,
+        id: group.id ?? group.key ?? group.name ?? group.title ?? group.label,
         title: group.title ?? group.label ?? group.name
       };
     });
   }
 
+  const groupMembers = collectGroupMembers(plan.groups);
+  const rawModules = Array.isArray(plan.modules)
+    ? plan.modules
+    : Array.isArray(plan.nodes)
+      ? plan.nodes
+      : Array.isArray(plan.items)
+        ? plan.items
+        : undefined;
+  if (rawModules) {
+    plan.modules = rawModules.map((module, index) =>
+      coercePlanModule(module, index, groupMembers, policy.defaultSource)
+    );
+  }
+
   if (Array.isArray(plan.connections)) {
-    plan.connections = plan.connections.map((connection) => {
-      if (!isRecord(connection)) return connection;
-      return {
-        ...connection,
-        style: connection.style ?? connection.lineStyle
-      };
-    });
+    plan.connections = plan.connections.map((connection) =>
+      coercePlanConnection(connection, policy.defaultSource)
+    );
+  } else if (Array.isArray(plan.edges)) {
+    plan.connections = plan.edges.map((connection) =>
+      coercePlanConnection(connection, policy.defaultSource)
+    );
   }
 
   if (Array.isArray(plan.layoutConstraints)) {
@@ -392,13 +427,115 @@ function coercePlannerJson(value: unknown, policy: PlanningPolicy): unknown {
   return plan;
 }
 
+function coercePlanModule(
+  value: unknown,
+  index: number,
+  groupMembers: Map<string, Set<string>>,
+  defaultSource: PlanSource
+): unknown {
+  if (!isRecord(value)) return value;
+  const rawLabel = stringValue(value.label, value.name, value.title, value.text, value.content);
+  const id = stringValue(value.id, value.key, value.nodeId, rawLabel, `module_${index + 1}`);
+  const label = rawLabel ?? id;
+  const explicitGroupId = stringValue(
+    value.groupId,
+    value.group,
+    value.group_id,
+    value.container,
+    value.layer,
+    value.stage
+  );
+  return {
+    ...value,
+    id,
+    label,
+    groupId: explicitGroupId ?? groupIdForMember(id, label, groupMembers),
+    shapeKey: stringValue(value.shapeKey, value.shape, value.shape_key),
+    source: coerceSource(value.source, defaultSource)
+  };
+}
+
+function coercePlanConnection(value: unknown, defaultSource: PlanSource): unknown {
+  if (!isRecord(value)) return value;
+  const from = stringValue(
+    value.from,
+    value.sourceNode,
+    value.source_node,
+    value.sourceId,
+    value.source_id,
+    value.source
+  );
+  const to = stringValue(
+    value.to,
+    value.target,
+    value.targetNode,
+    value.target_node,
+    value.targetId,
+    value.target_id,
+    value.destination
+  );
+  return {
+    ...value,
+    from,
+    to,
+    meaning: stringValue(value.meaning, value.label, value.text),
+    style: coerceLineStyle(value.style ?? value.lineStyle ?? value.line_style),
+    role: coerceConnectionRole(value.role),
+    source: coerceSource(value.source, defaultSource)
+  };
+}
+
+function collectGroupMembers(groups: unknown): Map<string, Set<string>> {
+  const result = new Map<string, Set<string>>();
+  if (!Array.isArray(groups)) return result;
+
+  for (const group of groups) {
+    if (!isRecord(group)) continue;
+    const groupId = stringValue(group.id, group.key, group.name, group.title, group.label);
+    if (!groupId) continue;
+    const members = firstArray(
+      group.modules,
+      group.nodes,
+      group.nodeIds,
+      group.items,
+      group.children,
+      group.members
+    );
+    if (!members) continue;
+    result.set(
+      groupId,
+      new Set(
+        members
+          .map((member) =>
+            isRecord(member)
+              ? stringValue(member.id, member.key, member.label, member.name, member.title)
+              : typeof member === "string"
+                ? member
+                : undefined
+          )
+          .filter((member): member is string => Boolean(member))
+      )
+    );
+  }
+
+  return result;
+}
+
+function groupIdForMember(
+  id: string | undefined,
+  label: string | undefined,
+  groupMembers: Map<string, Set<string>>
+): string | undefined {
+  for (const [groupId, members] of groupMembers.entries()) {
+    if ((id && members.has(id)) || (label && members.has(label))) return groupId;
+  }
+  return undefined;
+}
+
 function coerceLayoutConstraint(value: unknown, defaultSource: PlanSource): unknown[] {
   if (!isRecord(value)) return [value];
-  const type = value.type;
-  const provenance =
-    value.source === "user_explicit" || value.source === "model_inferred"
-      ? value.source
-      : defaultSource;
+  const type = coerceConstraintType(value.type ?? value.kind ?? value.relation);
+  const provenance = coerceSource(value.source, defaultSource);
 
   if (type === "main_flow" || type === "same_row" || type === "same_column") {
     const nodes =
@@ -412,6 +549,7 @@ function coerceLayoutConstraint(value: unknown, defaultSource: PlanSource): unkn
     return [
       {
         ...value,
+        type,
         nodes,
         source: provenance
       }
@@ -425,6 +563,7 @@ function coerceLayoutConstraint(value: unknown, defaultSource: PlanSource): unkn
     return [
       {
         ...value,
+        type,
         subject,
         object,
         source: provenance
@@ -447,6 +586,7 @@ function coerceLayoutConstraint(value: unknown, defaultSource: PlanSource): unkn
       .filter((subject): subject is string => typeof subject === "string")
       .map((subject) => ({
         ...value,
+        type,
         subject,
         container,
         source: provenance
@@ -463,6 +603,7 @@ function coerceLayoutConstraint(value: unknown, defaultSource: PlanSource): unkn
       .filter((target): target is string => typeof target === "string")
       .map((to) => ({
         ...value,
+        type,
         from,
         to,
         through: firstArray(value.through, value.via, value.nodes, value.modules),
@@ -473,9 +614,67 @@ function coerceLayoutConstraint(value: unknown, defaultSource: PlanSource): unkn
   return [
     {
       ...value,
+      type,
       source: provenance
     }
   ];
+}
+
+function coerceConstraintType(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  const normalized = value.trim();
+  const aliases: Record<string, string> = {
+    mainFlow: "main_flow",
+    main_flow_nodes: "main_flow",
+    flow: "main_flow",
+    sequence: "main_flow",
+    sameRow: "same_row",
+    row: "same_row",
+    horizontal: "same_row",
+    sameColumn: "same_column",
+    column: "same_column",
+    vertical: "same_column",
+    contains: "inside",
+    contain: "inside",
+    in: "inside",
+    within: "inside"
+  };
+  return aliases[normalized] ?? normalized;
+}
+
+function coerceSource(value: unknown, defaultSource: PlanSource): PlanSource {
+  return value === "user_explicit" || value === "model_inferred" ? value : defaultSource;
+}
+
+function coerceLineStyle(value: unknown): "solid" | "dashed" | undefined {
+  if (value === "solid" || value === "dashed") return value;
+  if (typeof value !== "string") return undefined;
+  if (/dash|dotted|虚线|点线/i.test(value)) return "dashed";
+  if (/solid|实线/i.test(value)) return "solid";
+  return undefined;
+}
+
+function coerceConnectionRole(value: unknown): DiagramPlanConnection["role"] | undefined {
+  if (
+    value === "main" ||
+    value === "auxiliary" ||
+    value === "branch" ||
+    value === "feedback" ||
+    value === "residual" ||
+    value === "merge" ||
+    value === "reference"
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function stringValue(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

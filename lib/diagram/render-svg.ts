@@ -51,6 +51,8 @@ export function renderSvg(diagram: NormalizedDiagramSpec, layout: LayoutSpec): s
           node?.label || shape.defaultLabel || "",
           nodeLayout.x + nodeLayout.width / 2,
           nodeLayout.y + nodeLayout.height / 2,
+          nodeLayout.width,
+          nodeLayout.height,
           shape
         )
       ].join("");
@@ -86,12 +88,15 @@ function renderMultilineText(
   label: string,
   centerX: number,
   centerY: number,
+  boxWidth: number,
+  boxHeight: number,
   shape: ShapeDefinition
 ): string {
-  const lines = label.split(/\n/).slice(0, 3);
-  const lineHeight = 17;
-  const startY = centerY - ((lines.length - 1) * lineHeight) / 2 + 5;
-  const fontSize = shape.style?.fontSize ?? (lines.some((line) => line.length > 18) ? 13 : 15);
+  const fontSize = shape.style?.fontSize ?? (label.length > 18 ? 13 : 15);
+  const lineHeight = Math.max(15, fontSize + 3);
+  const maxLines = Math.max(1, Math.min(3, Math.floor((boxHeight - 10) / lineHeight)));
+  const lines = wrapLabelLines(label, boxWidth, fontSize, maxLines);
+  const startY = centerY - ((lines.length - 1) * lineHeight) / 2 + fontSize * 0.35;
   const fontWeight = shape.style?.bold ? ` font-weight="700"` : "";
   const color = svgColor(shape.style?.textColor ?? COLORS.text);
 
@@ -101,6 +106,44 @@ function renderMultilineText(
         `<text x="${centerX}" y="${startY + index * lineHeight}" text-anchor="middle" font-size="${fontSize}"${fontWeight} fill="${color}">${escapeXml(line)}</text>`
     )
     .join("");
+}
+
+function wrapLabelLines(
+  label: string,
+  boxWidth: number,
+  fontSize: number,
+  maxLines: number
+): string[] {
+  const maxChars = Math.max(4, Math.floor((boxWidth - 22) / (fontSize * 0.95)));
+  const lines = label
+    .split(/\n/)
+    .flatMap((line) => wrapLine(line.trim(), maxChars))
+    .filter(Boolean);
+  if (lines.length <= maxLines) return lines;
+  return [
+    ...lines.slice(0, maxLines - 1),
+    `${lines.slice(maxLines - 1).join("").slice(0, maxChars - 1)}…`
+  ];
+}
+
+function wrapLine(line: string, maxChars: number): string[] {
+  if (/^[A-Za-z0-9_+\-*/]+$/.test(line)) return [line];
+  if (line.length <= maxChars) return [line];
+  const chunks: string[] = [];
+  let remaining = line;
+  while (remaining.length > maxChars) {
+    let splitAt = findSplitIndex(remaining, maxChars);
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
+
+function findSplitIndex(value: string, maxChars: number): number {
+  const softBreak = value.slice(0, maxChars + 1).search(/[，、/／\s-][^，、/／\s-]*$/);
+  if (softBreak > maxChars * 0.45) return softBreak + 1;
+  return maxChars;
 }
 
 function diamondPoints(rect: { x: number; y: number; width: number; height: number }): string {

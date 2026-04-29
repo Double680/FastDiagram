@@ -11,6 +11,7 @@ import { normalizeDiagramSpec } from "../lib/diagram/normalize.ts";
 import { renderPptx } from "../lib/diagram/render-pptx.ts";
 import { renderSvg } from "../lib/diagram/render-svg.ts";
 import { getShapeDefinition } from "../lib/diagram/shape-library/registry.ts";
+import type { DiagramLayoutConstraint, LayoutNode } from "../lib/diagram/types.ts";
 
 process.env.BASE_URL = "";
 process.env.API_KEY = "";
@@ -139,6 +140,234 @@ test("grouped research framework layout avoids overlaps for multi-input multi-ou
   assert.deepEqual(overlappingNodePairs(layout.nodes), []);
 });
 
+test("horizontal layered research framework layout keeps rows separated", () => {
+  const diagram = normalizeDiagramSpec({
+    title: "自下而上递进式研究框架图",
+    type: "research_framework",
+    nodes: [
+      { id: "background", label: "多模态理解模型在知识、感知、思考等多个维度分别呈现认知幻觉", groupId: "background_layer" },
+      { id: "knowledge", label: "底层知识", groupId: "cognitive_layer" },
+      { id: "perception", label: "表层感知", groupId: "cognitive_layer" },
+      { id: "reasoning", label: "深层思考", groupId: "cognitive_layer" },
+      { id: "challenge_k", label: "领域实体知识迁移弱", groupId: "challenge_layer" },
+      { id: "challenge_p", label: "跨模信号感知融合弱", groupId: "challenge_layer" },
+      { id: "challenge_r", label: "结构思考逻辑泛化弱", groupId: "challenge_layer" },
+      { id: "content_k", label: "跨模态语义双向互补的知识迁移增强方法", groupId: "content_layer" },
+      { id: "content_p", label: "层级信号自适应融合的跨模感知增强方法", groupId: "content_layer" },
+      { id: "content_r", label: "阶段性顶层策略引导的思维泛化增强方法", groupId: "content_layer" },
+      { id: "significance", label: "构建知识、感知、思考等认知维度自底向上的多模态模型能力增强体系，为科技文献挖掘等复杂场景可信理解提供全新思路", groupId: "significance_layer" }
+    ],
+    edges: [
+      { id: "e1", from: "knowledge", to: "perception" },
+      { id: "e2", from: "perception", to: "reasoning" },
+      { id: "e3", from: "background", to: "knowledge" },
+      { id: "e4", from: "challenge_k", to: "content_k" },
+      { id: "e5", from: "challenge_p", to: "content_p" },
+      { id: "e6", from: "challenge_r", to: "content_r" },
+      { id: "e7", from: "content_k", to: "content_p", label: "支撑 / 扩展" },
+      { id: "e8", from: "content_p", to: "content_r", label: "支撑 / 扩展" },
+      { id: "e9", from: "content_p", to: "significance" }
+    ],
+    groups: [
+      { id: "background_layer", title: "研究背景层", nodeIds: ["background"] },
+      { id: "cognitive_layer", title: "认知维度层", nodeIds: ["knowledge", "perception", "reasoning"] },
+      { id: "challenge_layer", title: "研究挑战层", nodeIds: ["challenge_k", "challenge_p", "challenge_r"] },
+      { id: "content_layer", title: "研究内容层", nodeIds: ["content_k", "content_p", "content_r"] },
+      { id: "significance_layer", title: "研究意义层", nodeIds: ["significance"] }
+    ],
+    layoutConstraints: [
+      { type: "main_flow", nodes: ["background", "knowledge", "challenge_k", "content_k", "significance"], direction: "bottom_to_top", source: "user_explicit" },
+      { type: "same_row", nodes: ["knowledge", "perception", "reasoning"], source: "user_explicit" },
+      { type: "same_row", nodes: ["challenge_k", "challenge_p", "challenge_r"], source: "user_explicit" },
+      { type: "same_row", nodes: ["content_k", "content_p", "content_r"], source: "user_explicit" }
+    ]
+  });
+  const layout = layoutDiagram(diagram);
+  const background = layout.nodes.find((node) => node.id === "background");
+  const significance = layout.nodes.find((node) => node.id === "significance");
+
+  assert.deepEqual(overlappingNodePairs(layout.nodes), []);
+  assert.ok(background && significance && background.y > significance.y);
+  assert.ok(layout.groups?.every((group) => group.y >= 0 && group.y + group.height <= layout.canvas.height));
+});
+
+test("grouped model architecture layout handles nested groups and orphan branch nodes", () => {
+  const diagram = normalizeDiagramSpec({
+    title: "Train / Inference 模型架构图",
+    type: "model_architecture",
+    nodes: [
+      { id: "base_model", label: "基础模型" },
+      { id: "stage1_cpt", label: "Stage1 CPT" },
+      { id: "m2t_doc_variants", label: "M2T Doc variants" },
+      { id: "t2t_doc_variants", label: "T2T Doc variants" },
+      { id: "stage2_sft", label: "Stage2 SFT" },
+      { id: "m2t_qa_variants", label: "M2T QA variants" },
+      { id: "t2t_qa_variants", label: "T2T QA variants" },
+      { id: "stage3_rl", label: "Stage3 RL" },
+      { id: "rollout", label: "Rollout" },
+      { id: "m2t_trajectories", label: "M2T Trajectories" },
+      { id: "t2t_trajectories", label: "T2T Trajectories" },
+      { id: "ebpo_policy_update", label: "EBPO Policy Update" },
+      { id: "prompt_block", label: "Prompt Block（Fixed Context）" },
+      { id: "decoding_block", label: "Decoding Block（Parallel Processing at Step t）" },
+      { id: "input_mask", label: "输入：[MASK]" },
+      { id: "action1_unmasking", label: "Action1 Unmasking" },
+      { id: "fill_highest_prob_token", label: "按最高概率填充 token" },
+      { id: "input_token_low_confidence", label: "输入：token（低置信度）" },
+      { id: "action2_correction_low", label: "Action2 Correction（低置信度）" },
+      { id: "keep_original_token", label: "保持原 token" },
+      { id: "input_token_high_confidence", label: "输入：token（高置信度且新 argmax 不同）" },
+      { id: "action2_correction_high", label: "Action2 Correction（高置信度且新 argmax 不同）" },
+      { id: "replace_token", label: "替换 token" }
+    ],
+    edges: [
+      { id: "e1", from: "base_model", to: "stage1_cpt" },
+      { id: "e2", from: "stage1_cpt", to: "stage2_sft" },
+      { id: "e3", from: "stage2_sft", to: "stage3_rl" },
+      { id: "e4", from: "stage3_rl", to: "rollout" },
+      { id: "e5", from: "rollout", to: "ebpo_policy_update" },
+      { id: "e6", from: "ebpo_policy_update", to: "stage3_rl", style: "dashed" },
+      { id: "e7", from: "input_mask", to: "action1_unmasking" },
+      { id: "e8", from: "action1_unmasking", to: "fill_highest_prob_token" },
+      { id: "e9", from: "input_token_low_confidence", to: "action2_correction_low" },
+      { id: "e10", from: "action2_correction_low", to: "keep_original_token" },
+      { id: "e11", from: "input_token_high_confidence", to: "action2_correction_high" },
+      { id: "e12", from: "action2_correction_high", to: "replace_token" }
+    ],
+    groups: [
+      {
+        id: "train_group",
+        title: "Train",
+        nodeIds: ["base_model", "stage1_cpt", "stage2_sft", "stage3_rl", "rollout", "ebpo_policy_update"]
+      },
+      {
+        id: "inference_group",
+        title: "Inference",
+        nodeIds: [
+          "prompt_block",
+          "decoding_block",
+          "input_mask",
+          "action1_unmasking",
+          "fill_highest_prob_token",
+          "input_token_low_confidence",
+          "action2_correction_low",
+          "keep_original_token",
+          "input_token_high_confidence",
+          "action2_correction_high",
+          "replace_token"
+        ]
+      },
+      { id: "rl_loop", title: "RL Rollout / Policy Update", nodeIds: ["rollout", "ebpo_policy_update"] }
+    ],
+    layoutConstraints: [
+      { type: "main_flow", nodes: ["base_model", "stage1_cpt", "stage2_sft", "stage3_rl"], direction: "top_to_bottom", source: "user_explicit" },
+      { type: "same_row", nodes: ["m2t_doc_variants", "t2t_doc_variants"], source: "user_explicit" },
+      { type: "same_row", nodes: ["m2t_qa_variants", "t2t_qa_variants"], source: "user_explicit" },
+      { type: "same_row", nodes: ["m2t_trajectories", "t2t_trajectories"], source: "user_explicit" },
+      { type: "inside", subject: "rollout", container: "rl_loop", source: "user_explicit" },
+      { type: "inside", subject: "ebpo_policy_update", container: "rl_loop", source: "user_explicit" }
+    ]
+  });
+  const layout = layoutDiagram(diagram);
+  const trainGroup = layout.groups?.find((group) => group.id === "train_group");
+  const branchNodes = [
+    "m2t_doc_variants",
+    "t2t_doc_variants",
+    "m2t_qa_variants",
+    "t2t_qa_variants",
+    "m2t_trajectories",
+    "t2t_trajectories"
+  ]
+    .map((id) => layout.nodes.find((node) => node.id === id))
+    .filter((node): node is NonNullable<typeof node> => Boolean(node));
+
+  assert.equal(new Set(layout.nodes.map((node) => node.id)).size, diagram.nodes.length);
+  assert.deepEqual(overlappingNodePairs(layout.nodes), []);
+  assert.ok(trainGroup);
+  assert.ok(branchNodes.every((node) => rectContains(trainGroup, node)));
+});
+
+test("grouped model architecture layout honors relative constraints inside dense groups", () => {
+  const diagram = normalizeDiagramSpec({
+    title: "Train / Inference 复杂模型架构图",
+    type: "model_architecture",
+    nodes: [
+      { id: "base_model", label: "Base Model" },
+      { id: "stage1_cpt", label: "Stage1: CPT Multi-Turn Forward w/" },
+      { id: "stage2_sft", label: "Stage2: SFT Multi-Turn Forward w/" },
+      { id: "stage3_rl", label: "Stage3: RL Mixture of M2T & T2T" },
+      { id: "rollout", label: "Rollout (SGLang Dual Mode)" },
+      { id: "ebpo_update", label: "EBPO Policy Update" },
+      { id: "m2t_doc_variants", label: "M2T Doc variants" },
+      { id: "t2t_doc_variants", label: "T2T Doc variants" },
+      { id: "m2t_qa_variants", label: "M2T QA variants" },
+      { id: "t2t_qa_variants", label: "T2T QA variants" },
+      { id: "prompt_block", label: "Prompt Block (Fixed Context)" },
+      { id: "decoding_block", label: "Decoding Block (Parallel Processing at Step t)" },
+      { id: "action1", label: "Action 1: Unmasking" },
+      { id: "action2_over", label: "Action 2: Correction" },
+      { id: "action2_lazy", label: "Action 2: Correction" },
+      { id: "input_mask", label: "x_t^i = [MASK]" },
+      { id: "unmask", label: "UNMASK" },
+      { id: "output_jumps", label: "x_{t-1}^i = jumps" },
+      { id: "input_over", label: "x_t^j = over" },
+      { id: "keep", label: "KEEP" },
+      { id: "output_over", label: "x_{t-1}^j = over" },
+      { id: "input_lazy", label: "x_t^k = lazy" },
+      { id: "replace", label: "REPLACE" },
+      { id: "output_dog", label: "x_{t-1}^k = dog" }
+    ],
+    edges: [
+      { id: "e1", from: "base_model", to: "stage1_cpt" },
+      { id: "e2", from: "stage1_cpt", to: "stage2_sft" },
+      { id: "e3", from: "stage2_sft", to: "stage3_rl" },
+      { id: "e4", from: "stage3_rl", to: "rollout" },
+      { id: "e5", from: "rollout", to: "ebpo_update" },
+      { id: "e6", from: "input_mask", to: "unmask" },
+      { id: "e7", from: "unmask", to: "output_jumps" },
+      { id: "e8", from: "input_over", to: "keep" },
+      { id: "e9", from: "keep", to: "output_over" },
+      { id: "e10", from: "input_lazy", to: "replace" },
+      { id: "e11", from: "replace", to: "output_dog" }
+    ],
+    groups: [
+      {
+        id: "train",
+        title: "Train",
+        nodeIds: ["base_model", "stage1_cpt", "stage2_sft", "stage3_rl", "rollout", "ebpo_update"]
+      },
+      {
+        id: "inference",
+        title: "Inference",
+        nodeIds: ["prompt_block", "decoding_block", "action1", "action2_over", "action2_lazy"]
+      }
+    ],
+    layoutConstraints: [
+      { type: "main_flow", nodes: ["base_model", "stage1_cpt", "stage2_sft", "stage3_rl"], direction: "top_to_bottom", source: "user_explicit" },
+      { type: "same_column", nodes: ["base_model", "stage1_cpt", "stage2_sft"], source: "user_explicit" },
+      { type: "right_of", subject: "stage3_rl", object: "stage2_sft", source: "user_explicit" },
+      { type: "below", subject: "rollout", object: "stage3_rl", source: "user_explicit" },
+      { type: "below", subject: "ebpo_update", object: "stage3_rl", source: "user_explicit" },
+      { type: "same_row", nodes: ["rollout", "ebpo_update"], source: "user_explicit" },
+      { type: "same_row", nodes: ["m2t_doc_variants", "t2t_doc_variants"], source: "user_explicit" },
+      { type: "same_row", nodes: ["m2t_qa_variants", "t2t_qa_variants"], source: "user_explicit" },
+      { type: "same_row", nodes: ["prompt_block", "decoding_block"], source: "user_explicit" },
+      { type: "left_of", subject: "prompt_block", object: "decoding_block", source: "user_explicit" },
+      { type: "same_row", nodes: ["action1", "action2_over", "action2_lazy"], source: "user_explicit" },
+      { type: "below", subject: "action1", object: "prompt_block", source: "user_explicit" },
+      { type: "below", subject: "action2_over", object: "decoding_block", source: "user_explicit" },
+      { type: "below", subject: "action2_lazy", object: "decoding_block", source: "user_explicit" },
+      { type: "main_flow", nodes: ["input_mask", "unmask", "output_jumps"], direction: "top_to_bottom", source: "user_explicit" },
+      { type: "main_flow", nodes: ["input_over", "keep", "output_over"], direction: "top_to_bottom", source: "user_explicit" },
+      { type: "main_flow", nodes: ["input_lazy", "replace", "output_dog"], direction: "top_to_bottom", source: "user_explicit" }
+    ]
+  });
+  const layout = layoutDiagram(diagram);
+
+  assert.deepEqual(overlappingNodePairs(layout.nodes), []);
+  assert.deepEqual(relativeConstraintViolations(diagram.layoutConstraints, layout.nodes), []);
+});
+
 function overlappingNodePairs(nodes: Array<{ id: string; x: number; y: number; width: number; height: number }>) {
   const pairs: string[][] = [];
   for (let leftIndex = 0; leftIndex < nodes.length; leftIndex += 1) {
@@ -156,6 +385,58 @@ function overlappingNodePairs(nodes: Array<{ id: string; x: number; y: number; w
     }
   }
   return pairs;
+}
+
+function rectContains(
+  outer: { x: number; y: number; width: number; height: number },
+  inner: { x: number; y: number; width: number; height: number }
+) {
+  return (
+    inner.x >= outer.x &&
+    inner.y >= outer.y &&
+    inner.x + inner.width <= outer.x + outer.width &&
+    inner.y + inner.height <= outer.y + outer.height
+  );
+}
+
+function relativeConstraintViolations(
+  constraints: DiagramLayoutConstraint[],
+  nodes: LayoutNode[]
+) {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const violations: string[] = [];
+
+  for (const constraint of constraints) {
+    if (constraint.type === "right_of") {
+      const subject = nodeById.get(constraint.subject);
+      const object = nodeById.get(constraint.object);
+      if (subject && object && subject.x <= object.x) {
+        violations.push(`${constraint.subject} should be right of ${constraint.object}`);
+      }
+    } else if (constraint.type === "left_of") {
+      const subject = nodeById.get(constraint.subject);
+      const object = nodeById.get(constraint.object);
+      if (subject && object && subject.x >= object.x) {
+        violations.push(`${constraint.subject} should be left of ${constraint.object}`);
+      }
+    } else if (constraint.type === "below") {
+      const subject = nodeById.get(constraint.subject);
+      const object = nodeById.get(constraint.object);
+      if (subject && object && subject.y <= object.y) {
+        violations.push(`${constraint.subject} should be below ${constraint.object}`);
+      }
+    } else if (constraint.type === "same_row") {
+      const rowNodes = constraint.nodes
+        .map((id) => nodeById.get(id))
+        .filter((node): node is LayoutNode => Boolean(node));
+      if (rowNodes.length >= 2) {
+        const rowSpread = Math.max(...rowNodes.map((node) => node.y)) - Math.min(...rowNodes.map((node) => node.y));
+        if (rowSpread >= 40) violations.push(`${constraint.nodes.join(",")} should share row`);
+      }
+    }
+  }
+
+  return violations;
 }
 
 test("svg renderer emits editable preview primitives", () => {
@@ -350,6 +631,76 @@ test("llm planner uses BASE_URL and API_KEY with chat completions format", async
     assert.equal(result.ok && result.plan.modules[1].shapeKey, "operator.add");
     assert.equal(
       result.ok && result.plan.layoutConstraints?.some((constraint) => constraint.type === "main_flow"),
+      true
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.env.BASE_URL = "";
+    process.env.API_KEY = "";
+    process.env.MODEL = "";
+  }
+});
+
+test("llm planner coerces common JSON aliases before validation", async () => {
+  const originalFetch = globalThis.fetch;
+  process.env.BASE_URL = "https://llm.example.test/v1";
+  process.env.API_KEY = "test-key";
+  process.env.MODEL = "test-model";
+
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                title: "别名测试图",
+                type: "research_framework",
+                description: "测试兼容不同模型的字段命名",
+                groups: [
+                  { id: "g1", label: "第一层", modules: ["a"] },
+                  { id: "g2", label: "第二层", modules: ["b"] }
+                ],
+                nodes: [
+                  { id: "a", name: "输入模块" },
+                  { id: "b", name: "输出模块" }
+                ],
+                edges: [
+                  {
+                    source: "a",
+                    target: "b",
+                    label: "流向",
+                    lineStyle: "dotted",
+                    role: "unknown-role"
+                  }
+                ],
+                layoutConstraints: [
+                  { type: "sameRow", modules: ["a", "b"], source: "a" },
+                  { type: "inside", group: "g1", nodes: ["a"] }
+                ],
+                assumptions: "字段别名应被兼容"
+              })
+            }
+          }
+        ]
+      }),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      }
+    )) as typeof fetch;
+
+  try {
+    const result = await createLlmDiagramPlan(createGenerationContext("绘制一个研究框架图"));
+
+    assert.equal(result.ok, true);
+    assert.equal(result.ok && result.plan.subject, "别名测试图");
+    assert.equal(result.ok && result.plan.modules[0].groupId, "g1");
+    assert.equal(result.ok && result.plan.connections[0].from, "a");
+    assert.equal(result.ok && result.plan.connections[0].to, "b");
+    assert.equal(result.ok && result.plan.connections[0].style, "dashed");
+    assert.equal(
+      result.ok && result.plan.layoutConstraints?.some((constraint) => constraint.type === "same_row"),
       true
     );
   } finally {
